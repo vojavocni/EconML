@@ -118,3 +118,6 @@ doc/_autosummary/
 
 # compiled C files
 *.c
+
+# vscode
+.vscode

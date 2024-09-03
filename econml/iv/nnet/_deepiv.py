@@ -7,14 +7,16 @@ import numpy as np
 from ..._cate_estimator import BaseCateEstimator
 from ...utilities import check_input_arrays, MissingModule
 try:
-    import keras
-    from keras import backend as K
-    import keras.layers as L
-    from keras.models import Model
+    import tensorflow as tf
+    # Unfortunatelly, tensorflow.keras is loaded lazily, so pylance will not recognize it.
+    # We use type ignore to tell pylance to ignore the import error.
+    from tensorflow.keras import backend as K  # type: ignore
+    import tensorflow.keras.layers as L  # type: ignore
+    from tensorflow.keras.models import Model  # type: ignore
 except ImportError as exn:
-    keras = K = L = Model = MissingModule("keras and tensorflow are no longer dependencies of the main econml "
-                                          "package; install econml[tf] or econml[all] to require them, or install "
-                                          "them separately, to use DeepIV", exn)
+    keras = K = L = Model = MissingModule("tensorflow is no longer a dependency of the main econml "
+                                          "package; install econml[tf] or econml[all] to require it, or install "
+                                          "it separately, to use DeepIV", exn)
 
 # TODO: make sure to use random seeds wherever necessary
 # TODO: make sure that the public API consistently uses "T" instead of "P" for the treatment
@@ -58,50 +60,36 @@ def mog_model(n_components, d_x, d_t):
     pi = L.Dense(n_components, activation='softmax')(x)
     mu = L.Reshape((n_components, d_t))(L.Dense(n_components * d_t)(x))
     log_sig = L.Dense(n_components)(x)
-    sig = L.Lambda(K.exp)(log_sig)
+    sig = L.Lambda(lambda x: K.exp(x), output_shape=(n_components,))(log_sig)
     return Model([x], [pi, mu, sig])
 
+class MogLossLayer(tf.keras.layers.Layer):
+    def __init__(self, n_components, d_t, **kwargs):
+        super(MogLossLayer, self).__init__(**kwargs)
+        self.n_components = n_components
+        self.d_t = d_t
 
-def mog_loss_model(n_components, d_t):
-    """
-    Create a Keras model that computes the loss of a mixture of Gaussians model on data.
+    def call(self, inputs):
+        pi, mu, sig, t = inputs
 
-    Parameters
-    ----------
-    n_components : int
-        The number of components in the mixture model
+        # || t - mu_i || ^2
+        d2 = tf.reduce_sum(tf.square(tf.expand_dims(t, 1) - mu), axis=-1)
 
-    d_t : int
-        The number of dimensions in the output
+        # LL = C - log(sum(pi_i/sig^d * exp(-d2/(2*sig^2))))
+        # Use reduce_logsumexp for numeric stability:
+        # LL = C - log(sum(exp(-d2/(2*sig^2) + log(pi_i/sig^d))))
+        ll = -tf.math.reduce_logsumexp(
+            -d2 / (2 * tf.square(sig)) + tf.math.log(pi / tf.pow(sig, self.d_t)),
+            axis=-1
+        )
 
-    Returns
-    -------
-    A Keras model that takes as inputs pi, mu, sigma, and t and generates a single output containing the loss.
+        # Add the mean loss to the layer
+        self.add_loss(tf.reduce_mean(ll))
 
-    """
-    pi = L.Input((n_components,))
-    mu = L.Input((n_components, d_t))
-    sig = L.Input((n_components,))
-    t = L.Input((d_t,))
+        return tf.expand_dims(ll, -1)
 
-    # || t - mu_i || ^2
-    d2 = L.Lambda(lambda d: K.sum(K.square(d), axis=-1),
-                  output_shape=(n_components,))(
-        L.Subtract()([L.RepeatVector(n_components)(t), mu])
-    )
-
-    # LL = C - log(sum(pi_i/sig^d * exp(-d2/(2*sig^2))))
-    # Use logsumexp for numeric stability:
-    # LL = C - log(sum(exp(-d2/(2*sig^2) + log(pi_i/sig^d))))
-    # TODO: does the numeric stability actually make any difference?
-    def make_logloss(d2, sig, pi):
-        return -K.logsumexp(-d2 / (2 * K.square(sig)) + K.log(pi / K.pow(sig, d_t)), axis=-1)
-
-    ll = L.Lambda(lambda dsp: make_logloss(*dsp), output_shape=(1,))([d2, sig, pi])
-
-    m = Model([pi, mu, sig, t], [ll])
-    return m
-
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0][0], 1)
 
 def mog_sample_model(n_components, d_t):
     """
@@ -338,15 +326,17 @@ class DeepIV(BaseCateEstimator):
 
         # the dimensionality of the output of the network
         # TODO: is there a more robust way to do this?
-        d_n = K.int_shape(treatment_network)[-1]
+        d_n = treatment_network.shape[-1]
 
         pi, mu, sig = mog_model(n_components, d_n, d_t)([treatment_network])
 
-        ll = mog_loss_model(n_components, d_t)([pi, mu, sig, t_in])
+        ll = MogLossLayer(n_components, d_t)([pi, mu, sig, t_in])
+        # ll.add_loss(L.Lambda(tf.reduce_mean)(ll))
 
         model = Model([z_in, x_in, t_in], [ll])
-        model.add_loss(L.Lambda(K.mean)(ll))
+        # model.add_loss(ll)
         model.compile(self._optimizer)
+
         # TODO: do we need to give the user more control over other arguments to fit?
         model.fit([Z, X, T], [], **self._first_stage_options)
 

@@ -46,12 +46,11 @@ automl = [
 ]
 tf = [
     # This extra is not currently compatible with python 3.9 or above because of tensorflow breaking changes
-    "keras < 2.4; python_version < '3.9'",
-    "tensorflow > 1.10, < 2.3; python_version < '3.9'",
+    "tensorflow > 2.3",
     # Version capped due to tensorflow incompatibility
-    "protobuf < 4; python_version < '3.9'",
+    "protobuf > 4",
     # Version capped due to tensorflow incompatibility
-    "numpy < 1.24; python_version < '3.9'"
+    "numpy > 1.24, < 2.0"
 ]
 plt = [
     "graphviz",
@@ -71,12 +70,11 @@ all = [
     # azureml-sdk[explain,automl] == 1.0.83
     "azure-cli",
     # This extra is not currently compatible with python 3.9 or above because of tensorflow breaking changes
-    "keras < 2.4; python_version < '3.9'",
-    "tensorflow > 1.10, < 2.3; python_version < '3.9'",
+    "tensorflow > 2.3",
     # Version capped due to tensorflow incompatibility
-    "protobuf < 4; python_version < '3.9'",
+    "protobuf > 4",
     # Version capped due to tensorflow incompatibility
-    "numpy < 1.24; python_version < '3.9'",
+    "numpy > 1.24, < 2.0",
     "graphviz",
     "matplotlib",    
     "dowhy < 0.12; python_version > '3.8'",
