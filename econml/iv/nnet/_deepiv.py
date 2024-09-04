@@ -153,7 +153,9 @@ def mog_sample_model(n_components, d_t):
     samp = L.Lambda(lambda pms: _zero_grad(sample(*pms), pms), output_shape=(d_t,))
     samp.trainable = False
 
-    return Model([pi, mu, sig], samp([pi, mu, sig]))
+    model = Model([pi, mu, sig], samp([pi, mu, sig]))
+
+    return model
 
 
 # three options: biased or upper-bound loss require a single number of samples;
@@ -331,20 +333,20 @@ class DeepIV(BaseCateEstimator):
         pi, mu, sig = mog_model(n_components, d_n, d_t)([treatment_network])
 
         ll = MogLossLayer(n_components, d_t)([pi, mu, sig, t_in])
-        # ll.add_loss(L.Lambda(tf.reduce_mean)(ll))
 
         model = Model([z_in, x_in, t_in], [ll])
-        # model.add_loss(ll)
         model.compile(self._optimizer)
 
         # TODO: do we need to give the user more control over other arguments to fit?
         model.fit([Z, X, T], [], **self._first_stage_options)
 
         lm = response_loss_model(lambda t, x: self._h(t, x),
-                                 lambda z, x: Model([z_in, x_in],
-                                                    # subtle point: we need to build a new model each time,
-                                                    # because each model encapsulates its randomness
-                                                    [mog_sample_model(n_components, d_t)([pi, mu, sig])])([z, x]),
+                                 lambda z, x: Model(
+                                     inputs=[z_in, x_in],
+                                     outputs=mog_sample_model(n_components, d_t)([pi, mu, sig])
+                                 )([z, x]),
+                                 # Note: We build a new model each time because
+                                 # each model encapsulates its own randomness
                                  d_z, d_x, d_y,
                                  self._n_samples, self._use_upper_bound_loss, self._n_gradient_samples)
 
