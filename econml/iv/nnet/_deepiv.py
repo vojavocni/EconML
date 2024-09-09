@@ -97,87 +97,110 @@ class MogLossLayer(tf.keras.layers.Layer):
     def compute_output_shape(self, input_shape):
         return (input_shape[0][0], 1)
 
-def mog_sample_model(n_components, d_t):
-    """
-    Create a model that generates samples from a mixture of Gaussians.
+class MogSampleLayer(tf.keras.layers.Layer):
+    def __init__(self, n_components, d_t, **kwargs):
+        super(MogSampleLayer, self).__init__(**kwargs)
+        self.n_components = n_components
+        self.d_t = d_t
 
-    Parameters
-    ----------
-    n_components : int
-        The number of components in the mixture model
+    def call(self, inputs):
+        pi, mu, sig = inputs
 
-    d_t : int
-        The number of dimensions in the output
+        # CNTK backend can't randomize across batches and doesn't implement cumsum (at least as of June 2018,
+        # see Known Issues on https://docs.microsoft.com/en-us/cognitive-toolkit/Using-CNTK-with-Keras)
+        def sample(pi, mu, sig):
+            batch_size = K.shape(pi)[0]
+            if K.backend() == 'cntk':
+                # generate cumulative sum via matrix multiplication
+                cumsum = K.dot(pi, K.constant(np.triu(np.ones((self.n_components, self.n_components)))))
+            else:
+                cumsum = K.cumsum(pi, 1)
+            cumsum_shift = K.concatenate([K.zeros_like(cumsum[:, 0:1]), cumsum])[:, :-1]
+            if K.backend() == 'cntk':
+                import cntk as C
+                # Generate standard uniform values in shape (batch_size,1)
+                #   (since we can't use the dynamic batch_size with random.uniform in CNTK,
+                #    we use uniform_like instead with an input of an appropriate shape)
+                rndSmp = C.random.uniform_like(pi[:, 0:1])
+            else:
+                rndSmp = K.random_uniform((batch_size, 1))
+            cmp1 = K.less_equal(cumsum_shift, rndSmp)
+            cmp2 = K.less(rndSmp, cumsum)
 
-    Returns
-    -------
-    A Keras model that takes as inputs pi, mu, and sigma, and generates a single output containing a sample.
+            # convert to floats and multiply to perform equivalent of logical AND
+            rndIndex = K.cast(cmp1, K.floatx()) * K.cast(cmp2, K.floatx())
 
-    """
-    pi = L.Input((n_components,))
-    mu = L.Input((n_components, d_t))
-    sig = L.Input((n_components,))
+            if K.backend() == 'cntk':
+                # Generate standard normal values in shape (batch_size,1,d_t)
+                #   (since we can't use the dynamic batch_size with random.normal in CNTK,
+                #    we use normal_like instead with an input of an appropriate shape)
+                rndNorms = C.random.normal_like(mu[:, 0:1, :])  # K.random_normal((1,d_t))
+            else:
+                rndNorms = K.random_normal((batch_size, 1, self.d_t))
 
-    # CNTK backend can't randomize across batches and doesn't implement cumsum (at least as of June 2018,
-    # see Known Issues on https://docs.microsoft.com/en-us/cognitive-toolkit/Using-CNTK-with-Keras)
-    def sample(pi, mu, sig):
-        batch_size = K.shape(pi)[0]
-        if K.backend() == 'cntk':
-            # generate cumulative sum via matrix multiplication
-            cumsum = K.dot(pi, K.constant(np.triu(np.ones((n_components, n_components)))))
-        else:
-            cumsum = K.cumsum(pi, 1)
-        cumsum_shift = K.concatenate([K.zeros_like(cumsum[:, 0:1]), cumsum])[:, :-1]
-        if K.backend() == 'cntk':
-            import cntk as C
-            # Generate standard uniform values in shape (batch_size,1)
-            #   (since we can't use the dynamic batch_size with random.uniform in CNTK,
-            #    we use uniform_like instead with an input of an appropriate shape)
-            rndSmp = C.random.uniform_like(pi[:, 0:1])
-        else:
-            rndSmp = K.random_uniform((batch_size, 1))
-        cmp1 = K.less_equal(cumsum_shift, rndSmp)
-        cmp2 = K.less(rndSmp, cumsum)
+            rndVec = mu + K.expand_dims(sig) * rndNorms
 
-        # convert to floats and multiply to perform equivalent of logical AND
-        rndIndex = K.cast(cmp1, K.floatx()) * K.cast(cmp2, K.floatx())
+            # exactly one entry should be nonzero for each b,d combination; use sum to select it
+            return K.sum(K.expand_dims(rndIndex) * rndVec, 1)
 
-        if K.backend() == 'cntk':
-            # Generate standard normal values in shape (batch_size,1,d_t)
-            #   (since we can't use the dynamic batch_size with random.normal in CNTK,
-            #    we use normal_like instead with an input of an appropriate shape)
-            rndNorms = C.random.normal_like(mu[:, 0:1, :])  # K.random_normal((1,d_t))
-        else:
-            rndNorms = K.random_normal((batch_size, 1, d_t))
+        # prevent gradient from passing through sampling
+        samp = L.Lambda(lambda pms: _zero_grad(sample(*pms), pms), output_shape=(self.d_t,))
+        samp.trainable = False
 
-        rndVec = mu + K.expand_dims(sig) * rndNorms
-
-        # exactly one entry should be nonzero for each b,d combination; use sum to select it
-        return K.sum(K.expand_dims(rndIndex) * rndVec, 1)
-
-    # prevent gradient from passing through sampling
-    samp = L.Lambda(lambda pms: _zero_grad(sample(*pms), pms), output_shape=(d_t,))
-    samp.trainable = False
-
-    model = Model([pi, mu, sig], samp([pi, mu, sig]))
-
-    return model
+        return samp([pi, mu, sig])
 
 
 # three options: biased or upper-bound loss require a single number of samples;
 #                unbiased can take different numbers for the network and its gradient
 class ResponseLossLayer(tf.keras.layers.Layer):
-    def __init__(self, h, p, d_z, d_x, d_y, samples=1, use_upper_bound=False, gradient_samples=0, **kwargs):
+    def __init__(self, response_network, pi, mu, sig, instrument_dim, feature_dim, outcome_dim, n_components, d_t,
+                 response_samples=1, use_upper_bound_loss=False, gradient_samples=0, **kwargs):
+        """
+        Initialize the ResponseLossLayer.
+
+        Parameters
+        ----------
+        response_network : callable
+            The response network.
+        pi : tf.keras.layers.Layer
+            The pi layer.
+        mu : tf.keras.layers.Layer
+            The mu layer.
+        sig : tf.keras.layers.Layer
+            The sig layer.
+        instrument_dim : int
+            The dimension of the instruments.
+        feature_dim : int
+            The dimension of the features.
+        outcome_dim : int
+            The dimension of the outcome.
+        response_samples : int, optional (default=1)
+            The number of samples to use for estimating the response.
+        use_upper_bound_loss : bool, optional (default=False)
+            Whether to use the upper bound loss.
+        gradient_samples : int, optional (default=0)
+            The number of samples to use for estimating the gradient.
+            If non-zero, uses a separate sampling for the gradient.
+
+        Notes
+        -----
+        Either use_upper_bound_loss or gradient_samples can be specified, but not both.
+        """
         super(ResponseLossLayer, self).__init__(**kwargs)
-        self.h = h
-        self.p = p
-        self.d_z = d_z
-        self.d_x = d_x
-        self.d_y = d_y
-        self.samples = samples
-        self.use_upper_bound = use_upper_bound
+        self.response_network = response_network
+        self.pi = pi
+        self.mu = mu
+        self.sig = sig
+        self.instrument_dim = instrument_dim
+        self.feature_dim = feature_dim
+        self.outcome_dim = outcome_dim
+        self.n_components = n_components
+        self.d_t = d_t
+        self.response_samples = response_samples
+        self.use_upper_bound_loss = use_upper_bound_loss
         self.gradient_samples = gradient_samples
-        assert not (use_upper_bound and gradient_samples)
+
+        assert not (use_upper_bound_loss and gradient_samples)
 
     def call(self, inputs):
         z, x, y = inputs
@@ -190,20 +213,34 @@ class ResponseLossLayer(tf.keras.layers.Layer):
             else:
                 return L.average([f() for _ in range(n)])
 
+        def sample_model():
+            return Model(
+                inputs=[L.Input((self.instrument_dim,)), L.Input((self.feature_dim,))],
+                outputs=MogSampleLayer(self.n_components, self.d_t)([self.pi, self.mu, self.sig])
+            )
+
         if self.gradient_samples:
             # we want to separately sample the gradient; we use stop_gradient to treat the sampled model as constant
             # the overall computation ensures that we have an interpretable loss (y-h̅(p,x))²,
             # but also that the gradient is -2(y-h̅(p,x))∇h̅(p,x) with *different* samples used for each average
-            diff = L.subtract([y, sample(lambda: self.h(self.p(z, x), x), self.samples)])
-            grad = sample(lambda: self.h(self.p(z, x), x), self.gradient_samples)
+            diff = L.subtract([
+                y,
+                sample(lambda: self.response_network(sample_model()([z, x]), x), self.response_samples)
+            ])
+            grad = sample(lambda: self.response_network(sample_model()([z, x]), x), self.gradient_samples)
 
             def make_expr(grad, diff):
                 return K.stop_gradient(diff) * (K.stop_gradient(diff + 2 * grad) - 2 * grad)
             expr = L.Lambda(lambda args: make_expr(*args))([grad, diff])
         elif self.use_upper_bound:
-            expr = sample(lambda: L.Lambda(K.square)(L.subtract([y, self.h(self.p(z, x), x)])), self.samples)
+            expr = sample(
+                lambda: L.Lambda(K.square)(L.subtract([y, self.response_network(sample_model()([z, x]), x)])),
+                self.samples
+            )
         else:
-            expr = L.Lambda(K.square)(L.subtract([y, sample(lambda: self.h(self.p(z, x), x), self.samples)]))
+            expr = L.Lambda(K.square)(
+                L.subtract([y, sample(lambda: self.response_network(sample_model()([z, x]), x), self.samples)])
+            )
 
         self.add_loss(K.mean(expr)) # add the loss to the layer
 
@@ -327,14 +364,12 @@ class DeepIV(BaseCateEstimator):
         # TODO: do we need to give the user more control over other arguments to fit?
         model.fit([Z, X, T], [], **self._first_stage_options)
 
-        response_loss = ResponseLossLayer(self._h,
-                                         lambda z, x: Model(
-                                             inputs=[z_in, x_in],
-                                             outputs=mog_sample_model(n_components, d_t)([pi, mu, sig])
-                                         )([z, x]),
-                                         # Note: We build a new model each time because
-                                         # each model encapsulates its own randomness
+        # mog_sample_model could be encapsulated in the class.
+        # It's not really readable to to have a lambda function that builds a model.
+        response_loss = ResponseLossLayer(self._response_model,
+                                          pi, mu, sig,
                                          d_z, d_x, d_y,
+                                         n_components, d_t,
                                          self._n_samples, self._use_upper_bound_loss, self._n_gradient_samples)
 
         rl = response_loss([z_in, x_in, y_in])
