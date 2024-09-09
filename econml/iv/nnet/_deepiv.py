@@ -73,15 +73,21 @@ class MogLossLayer(tf.keras.layers.Layer):
         pi, mu, sig, t = inputs
 
         # || t - mu_i || ^2
-        d2 = tf.reduce_sum(tf.square(tf.expand_dims(t, 1) - mu), axis=-1)
+        d2 = L.Lambda(lambda d: K.sum(K.square(d), axis=-1),
+                  output_shape=(self.n_components,))(
+            L.Subtract()([L.RepeatVector(self.n_components)(t), mu])
+        )
 
         # LL = C - log(sum(pi_i/sig^d * exp(-d2/(2*sig^2))))
         # Use reduce_logsumexp for numeric stability:
         # LL = C - log(sum(exp(-d2/(2*sig^2) + log(pi_i/sig^d))))
-        ll = -tf.math.reduce_logsumexp(
-            -d2 / (2 * tf.square(sig)) + tf.math.log(pi / tf.pow(sig, self.d_t)),
-            axis=-1
-        )
+        def make_logloss(d2, sig, pi):
+            return -tf.math.reduce_logsumexp(
+                -d2 / (2 * tf.square(sig)) + tf.math.log(pi / tf.pow(sig, self.d_t)),
+                axis=-1
+            )
+
+        ll = L.Lambda(lambda dsp: make_logloss(*dsp), output_shape=(1,))([d2, sig, pi])
 
         # Add the mean loss to the layer
         self.add_loss(tf.reduce_mean(ll))
@@ -160,70 +166,51 @@ def mog_sample_model(n_components, d_t):
 
 # three options: biased or upper-bound loss require a single number of samples;
 #                unbiased can take different numbers for the network and its gradient
-def response_loss_model(h, p, d_z, d_x, d_y, samples=1, use_upper_bound=False, gradient_samples=0):
-    """
-    Create a Keras model that computes the loss of a response model on data.
+class ResponseLossLayer(tf.keras.layers.Layer):
+    def __init__(self, h, p, d_z, d_x, d_y, samples=1, use_upper_bound=False, gradient_samples=0, **kwargs):
+        super(ResponseLossLayer, self).__init__(**kwargs)
+        self.h = h
+        self.p = p
+        self.d_z = d_z
+        self.d_x = d_x
+        self.d_y = d_y
+        self.samples = samples
+        self.use_upper_bound = use_upper_bound
+        self.gradient_samples = gradient_samples
+        assert not (use_upper_bound and gradient_samples)
 
-    Parameters
-    ----------
-    h : (tensor, tensor) -> Layer
-        Method for building a model of y given p and x
+    def call(self, inputs):
+        z, x, y = inputs
 
-    p : (tensor, tensor) -> Layer
-        Method for building a model of p given z and x
+        # sample: (() -> Layer, int) -> Layer
+        def sample(f, n):
+            assert n > 0
+            if n == 1:
+                return f()
+            else:
+                return L.average([f() for _ in range(n)])
 
-    d_z : int
-        The number of dimensions in z
+        if self.gradient_samples:
+            # we want to separately sample the gradient; we use stop_gradient to treat the sampled model as constant
+            # the overall computation ensures that we have an interpretable loss (y-h̅(p,x))²,
+            # but also that the gradient is -2(y-h̅(p,x))∇h̅(p,x) with *different* samples used for each average
+            diff = L.subtract([y, sample(lambda: self.h(self.p(z, x), x), self.samples)])
+            grad = sample(lambda: self.h(self.p(z, x), x), self.gradient_samples)
 
-    d_x :  int
-        Tbe number of dimensions in x
-
-    d_y : int
-        The number of dimensions in y
-
-    samples: int
-        The number of samples to use
-
-    use_upper_bound : bool
-        Whether to use an upper bound to the true loss
-        (equivalent to adding a regularization penalty on the variance of h)
-
-    gradient_samples : int
-        The number of separate additional samples to use when calculating the gradient.
-        This can only be nonzero if user_upper_bound is False, in which case the gradient of
-        the returned loss will be an unbiased estimate of the gradient of the true loss.
-
-    Returns
-    -------
-    A Keras model that takes as inputs z, x, and y and generates a single output containing the loss.
-
-    """
-    assert not (use_upper_bound and gradient_samples)
-
-    # sample: (() -> Layer, int) -> Layer
-    def sample(f, n):
-        assert n > 0
-        if n == 1:
-            return f()
+            def make_expr(grad, diff):
+                return K.stop_gradient(diff) * (K.stop_gradient(diff + 2 * grad) - 2 * grad)
+            expr = L.Lambda(lambda args: make_expr(*args))([grad, diff])
+        elif self.use_upper_bound:
+            expr = sample(lambda: L.Lambda(K.square)(L.subtract([y, self.h(self.p(z, x), x)])), self.samples)
         else:
-            return L.average([f() for _ in range(n)])
-    z, x, y = [L.Input((d,)) for d in [d_z, d_x, d_y]]
-    if gradient_samples:
-        # we want to separately sample the gradient; we use stop_gradient to treat the sampled model as constant
-        # the overall computation ensures that we have an interpretable loss (y-h̅(p,x))²,
-        # but also that the gradient is -2(y-h̅(p,x))∇h̅(p,x) with *different* samples used for each average
-        diff = L.subtract([y, sample(lambda: h(p(z, x), x), samples)])
-        grad = sample(lambda: h(p(z, x), x), gradient_samples)
+            expr = L.Lambda(K.square)(L.subtract([y, sample(lambda: self.h(self.p(z, x), x), self.samples)]))
 
-        def make_expr(grad, diff):
-            return K.stop_gradient(diff) * (K.stop_gradient(diff + 2 * grad) - 2 * grad)
-        expr = L.Lambda(lambda args: make_expr(*args))([grad, diff])
-    elif use_upper_bound:
-        expr = sample(lambda: L.Lambda(K.square)(L.subtract([y, h(p(z, x), x)])), samples)
-    else:
-        expr = L.Lambda(K.square)(L.subtract([y, sample(lambda: h(p(z, x), x), samples)]))
-    return Model([z, x, y], [expr])
+        self.add_loss(K.mean(expr)) # add the loss to the layer
 
+        return expr
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0][0], 1)
 
 class DeepIV(BaseCateEstimator):
     """
@@ -234,10 +221,10 @@ class DeepIV(BaseCateEstimator):
     n_components : int
         Number of components in the mixture density network
 
-    m : (tensor, tensor) -> Layer
-        Method for building a Keras model that featurizes the z and x inputs
+    treatment_model : tf.keras.Model
+        Method for building a Keras model that predicts the treatment given the instruments and features
 
-    h : (tensor, tensor) -> Layer
+    response_model : tf.keras.Model
         Method for building a model of y given t and x
 
     n_samples : int
@@ -269,15 +256,15 @@ class DeepIV(BaseCateEstimator):
 
     def __init__(self, *,
                  n_components,
-                 m,
-                 h,
+                 treatment_model,
+                 response_model,
                  n_samples, use_upper_bound_loss=False, n_gradient_samples=0,
                  optimizer='adam',
                  first_stage_options={"epochs": 100},
                  second_stage_options={"epochs": 100}):
         self._n_components = n_components
-        self._m = m
-        self._h = h
+        self._treatment_model = treatment_model
+        self._response_model = response_model
         self._n_samples = n_samples
         self._use_upper_bound_loss = use_upper_bound_loss
         self._n_gradient_samples = n_gradient_samples
@@ -324,13 +311,13 @@ class DeepIV(BaseCateEstimator):
         x_in, y_in, z_in, t_in = [L.Input((d,)) for d in [d_x, d_y, d_z, d_t]]
         n_components = self._n_components
 
-        treatment_network = self._m(z_in, x_in)
+        treatment_model_output = self._treatment_model(L.Concatenate()([z_in, x_in]))
 
         # the dimensionality of the output of the network
         # TODO: is there a more robust way to do this?
-        d_n = treatment_network.shape[-1]
+        d_n = treatment_model_output.shape[-1]
 
-        pi, mu, sig = mog_model(n_components, d_n, d_t)([treatment_network])
+        pi, mu, sig = mog_model(n_components, d_n, d_t)([treatment_model_output])
 
         ll = MogLossLayer(n_components, d_t)([pi, mu, sig, t_in])
 
@@ -340,20 +327,20 @@ class DeepIV(BaseCateEstimator):
         # TODO: do we need to give the user more control over other arguments to fit?
         model.fit([Z, X, T], [], **self._first_stage_options)
 
-        lm = response_loss_model(lambda t, x: self._h(t, x),
-                                 lambda z, x: Model(
-                                     inputs=[z_in, x_in],
-                                     outputs=mog_sample_model(n_components, d_t)([pi, mu, sig])
-                                 )([z, x]),
-                                 # Note: We build a new model each time because
-                                 # each model encapsulates its own randomness
-                                 d_z, d_x, d_y,
-                                 self._n_samples, self._use_upper_bound_loss, self._n_gradient_samples)
+        response_loss = ResponseLossLayer(self._h,
+                                         lambda z, x: Model(
+                                             inputs=[z_in, x_in],
+                                             outputs=mog_sample_model(n_components, d_t)([pi, mu, sig])
+                                         )([z, x]),
+                                         # Note: We build a new model each time because
+                                         # each model encapsulates its own randomness
+                                         d_z, d_x, d_y,
+                                         self._n_samples, self._use_upper_bound_loss, self._n_gradient_samples)
 
-        rl = lm([z_in, x_in, y_in])
+        rl = response_loss([z_in, x_in, y_in])
         response_model = Model([z_in, x_in, y_in], [rl])
-        response_model.add_loss(L.Lambda(K.mean)(rl))
         response_model.compile(self._optimizer)
+
         # TODO: do we need to give the user more control over other arguments to fit?
         response_model.fit([Z, X, Y], [], **self._second_stage_options)
 
